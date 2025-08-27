@@ -1,0 +1,55 @@
+name: Deploy Azure Function
+
+on:
+  push:
+    branches:
+      - main
+      - contactformnew
+  workflow_dispatch:
+
+env:
+  AZURE_FUNCTIONAPP_NAME: BullAttorneysFunctionApp
+  AZURE_RESOURCE_GROUP: BullAttorneys_group
+  NODE_VERSION: '18.x'
+  WORKING_DIRECTORY: .
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Build
+        run: npm run build
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure app settings
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az functionapp config appsettings set \
+              --name $AZURE_FUNCTIONAPP_NAME \
+              --resource-group $AZURE_RESOURCE_GROUP \
+              --settings "ACS_CONNECTION_STRING=${{ secrets.ACS_CONNECTION_STRING }}" "SENDER_EMAIL_ADDRESS=${{ secrets.SENDER_EMAIL_ADDRESS }}"
+
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: ${{ env.WORKING_DIRECTORY }}
+          respect-funcignore: true
