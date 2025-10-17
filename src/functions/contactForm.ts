@@ -1,10 +1,20 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
 import { EmailClient } from "@azure/communication-email";
 
-// Move these to environment variables in Azure Function App settings
+// Environment variables - set these in Azure Function App settings
 const CONNECTION_STRING = process.env.ACS_CONNECTION_STRING as string;
 const SENDER_ADDRESS = process.env.SENDER_EMAIL_ADDRESS || "DoNotReply@2dde48cf-f3cb-436b-838a-1c27aa0e1c0c.azurecomm.net";
-const RECIPIENT_ADDRESSES = ["brad@bullattorneys.com","web@bullattorneys.com"];
+const RECIPIENT_ADDRESSES = ["brad@bullattorneys.com", "web@bullattorneys.com"];
+const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY as string;
+
+// Rate limiting store (in production, use Redis or a database)
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+// Blocked emails
+const BLOCKED_EMAILS = [
+  'jacobroyvisser55@gmail.com',
+  // Add more blocked emails here
+];
 
 interface ContactFormData {
   firstName: string;
@@ -14,151 +24,410 @@ interface ContactFormData {
   zipCode: string;
   caseType: string;
   description?: string;
+  recaptchaToken?: string;
+  website?: string; // Honeypot field
+}
+
+// Rate limiting function
+function checkRateLimit(identifier: string, maxRequests = 3, windowMs = 60000): boolean {
+  const now = Date.now();
+  const record = rateLimitStore.get(identifier);
+
+  if (!record || now > record.resetTime) {
+    rateLimitStore.set(identifier, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+
+  if (record.count >= maxRequests) {
+    return false;
+  }
+
+  record.count++;
+  return true;
+}
+
+// reCAPTCHA validation function
+async function validateRecaptcha(token: string): Promise<{ success: boolean; score: number }> {
+  try {
+    const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: `secret=${RECAPTCHA_SECRET_KEY}&response=${token}`,
+    });
+
+    const data = await response.json();
+    return {
+      success: data.success || false,
+      score: data.score || 0
+    };
+  } catch (error) {
+    console.error('reCAPTCHA validation error:', error);
+    return { success: false, score: 0 };
+  }
+}
+
+// Gibberish detection function
+function isGibberish(text: string): boolean {
+  if (!text || text.length < 2) return false;
+  
+  // Check for vowels - real names usually have vowels
+  const vowelCount = (text.match(/[aeiouAEIOU]/g) || []).length;
+  const consonantCount = text.length - vowelCount;
+  
+  // If no vowels or too many consonants in a row, likely gibberish
+  if (vowelCount === 0 || consonantCount / text.length > 0.8) {
+    return true;
+  }
+  
+  // Check for excessive repeated characters
+  const repeatedChars = text.match(/(.)\1{2,}/g);
+  if (repeatedChars && repeatedChars.length > 0) {
+    return true;
+  }
+  
+  return false;
+}
+
+// URL spam detection
+function containsUrls(text: string): boolean {
+  const urlRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[^\s]+\.(com|net|org|edu|gov|mil|int|co|io|ly|me|tv|info|biz|name|mobi|tel|travel)[^\s]*)/gi;
+  return urlRegex.test(text);
+}
+
+// Email validation
+function isValidEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+// Phone validation
+function isValidPhone(phone: string): boolean {
+  const phoneDigits = phone.replace(/\D/g, '');
+  return phoneDigits.length >= 10;
+}
+
+// Zip code validation
+function isValidZipCode(zipCode: string): boolean {
+  const zipRegex = /^\d{5}(-\d{4})?$/;
+  return zipRegex.test(zipCode);
 }
 
 export async function contactForm(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
-  context.log('ContactForm function processing started');
-  
+  context.log('Contact form function triggered');
+
+  // Handle CORS preflight
+  if (request.method === 'OPTIONS') {
+    return {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Accept',
+        'Access-Control-Max-Age': '86400'
+      }
+    };
+  }
+
+  // Only allow POST requests
+  if (request.method !== 'POST') {
+    return {
+      status: 405,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ error: 'Method not allowed' })
+    };
+  }
+
   try {
-    context.log('Parsing request body');
-    const requestBody = await request.text();
-    context.log(`Request body: ${requestBody}`);
-    
+    // Get client IP for rate limiting
+    const clientIp = request.headers.get('x-forwarded-for') || 
+                     request.headers.get('x-real-ip') || 
+                     'unknown';
+
+    // Parse request body
     let formData: ContactFormData;
     try {
-      formData = JSON.parse(requestBody) as ContactFormData;
-      context.log('Successfully parsed JSON data', formData);
+      const body = await request.text();
+      formData = JSON.parse(body);
     } catch (parseError) {
-      context.error('Failed to parse request body as JSON:', parseError);
+      context.log('Invalid JSON in request body:', parseError);
       return {
         status: 400,
-        jsonBody: { error: "Invalid JSON in request body" }
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Invalid request format' })
+      };
+    }
+
+    context.log('Received form data:', { 
+      firstName: formData.firstName, 
+      lastName: formData.lastName, 
+      email: formData.email,
+      caseType: formData.caseType,
+      hasRecaptcha: !!formData.recaptchaToken 
+    });
+
+    // Honeypot check
+    if (formData.website && formData.website.trim() !== '') {
+      context.log('Honeypot triggered - bot detected');
+      return {
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Spam detected' })
+      };
+    }
+
+    // Check blocked emails
+    if (formData.email && BLOCKED_EMAILS.includes(formData.email.toLowerCase())) {
+      context.log('Blocked email attempted:', formData.email);
+      return {
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Email not allowed' })
+      };
+    }
+
+    // Rate limiting
+    if (!checkRateLimit(clientIp, 3, 60000)) {
+      context.log('Rate limit exceeded for IP:', clientIp);
+      return {
+        status: 429,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Too many requests. Please try again later.' })
       };
     }
 
     // Validate required fields
-    context.log('Validating required fields');
-    if (!formData.firstName || !formData.lastName || !formData.email || !formData.phone || !formData.zipCode || !formData.caseType) {
-      const missingFields = [];
-      if (!formData.firstName) missingFields.push('firstName');
-      if (!formData.lastName) missingFields.push('lastName');
-      if (!formData.email) missingFields.push('email');
-      if (!formData.phone) missingFields.push('phone');
-      if (!formData.zipCode) missingFields.push('zipCode');
-      if (!formData.caseType) missingFields.push('caseType');
-      
-      context.log(`Validation failed. Missing fields: ${missingFields.join(', ')}`);
+    const requiredFields = ['firstName', 'lastName', 'email', 'phone', 'zipCode', 'caseType'];
+    for (const field of requiredFields) {
+      if (!formData[field as keyof ContactFormData] || 
+          String(formData[field as keyof ContactFormData]).trim() === '') {
+        return {
+          status: 400,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ error: `${field} is required` })
+        };
+      }
+    }
+
+    // Validate field lengths
+    const maxLengths = {
+      firstName: 50,
+      lastName: 50,
+      email: 100,
+      phone: 20,
+      zipCode: 10,
+      caseType: 50,
+      description: 1200
+    };
+
+    for (const [field, maxLength] of Object.entries(maxLengths)) {
+      const value = formData[field as keyof ContactFormData];
+      if (value && String(value).length > maxLength) {
+        return {
+          status: 400,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ error: `${field} is too long (max ${maxLength} characters)` })
+        };
+      }
+    }
+
+    // Validate email format
+    if (!isValidEmail(formData.email)) {
       return {
         status: 400,
-        jsonBody: { error: "All required fields must be filled out", missingFields }
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Invalid email format' })
       };
     }
 
-    // Initialize Email Client
-    context.log('Initializing Email Client');
-    context.log(`Using connection string starting with: ${CONNECTION_STRING.substring(0, 30)}...`);
-    context.log(`Sender address: ${SENDER_ADDRESS}`);
-    context.log(`Recipient addresses: ${RECIPIENT_ADDRESSES.join(', ')}`);
-    
-    try {
-      const emailClient = new EmailClient(CONNECTION_STRING);
-      context.log('Email client initialized successfully');
-
-      const { firstName, lastName, email, phone, zipCode, caseType, description } = formData;
-
-      // Send notification email
-      context.log('Preparing notification email');
-      const notificationEmail = {
-        senderAddress: SENDER_ADDRESS,
-        content: {
-          subject: `New Contact Form - ${caseType} Case`,
-          plainText: `New Contact Form Submission\nCase Type: ${caseType}\nName: ${firstName} ${lastName}\nEmail: ${email}\nPhone: ${phone}\nZip Code: ${zipCode}${description ? `\nDescription: ${description}` : ''}`,
-          html: `
-            <h2>New Contact Form Submission</h2>
-            <p><strong>Case Type:</strong> ${caseType}</p>
-            <p><strong>Name:</strong> ${firstName} ${lastName}</p>
-            <p><strong>Email:</strong> ${email}</p>
-            <p><strong>Phone:</strong> ${phone}</p>
-            <p><strong>Zip Code:</strong> ${zipCode}</p>
-            ${description ? `<p><strong>Description:</strong><br>${description}</p>` : ''}
-          `
-        },
-        recipients: { 
-          to: RECIPIENT_ADDRESSES.map(address => ({ address }))
-        }
-      };
-
-      context.log('Sending notification email');
-      try {
-        const notificationPoller = await emailClient.beginSend(notificationEmail);
-        context.log('Notification email send initiated, waiting for completion');
-        await notificationPoller.pollUntilDone();
-        context.log('Notification email sent successfully');
-      } catch (emailError: any) {
-        context.error('Error sending notification email:', emailError);
-        throw new Error(`Failed to send notification email: ${emailError.message}`);
-      }
-
-      // Send auto-reply
-      context.log('Preparing auto-reply email');
-      const autoReplyEmail = {
-        senderAddress: SENDER_ADDRESS,
-        content: {
-          subject: "Thank you for contacting Bull Attorneys",
-          plainText: `Thank you for contacting Bull Attorneys\n\nDear ${firstName} ${lastName},\n\nWe have received your inquiry regarding your ${caseType} case. One of our attorneys will review your information and contact you shortly.\n\nIf you need immediate assistance, please call us at (316) 684-4400.\n\nBest regards,\nBull Attorneys Team`,
-          html: `
-            <h2>Thank you for contacting Bull Attorneys</h2>
-            <p>Dear ${firstName} ${lastName},</p>
-            <p>We have received your inquiry regarding your ${caseType} case. One of our attorneys will review your information and contact you shortly.</p>
-            <p>If you need immediate assistance, please call us at <a href="tel:+13166844400">(316) 684-4400</a>.</p>
-            <p>Best regards,<br>Bull Attorneys Team</p>
-          `
-        },
-        recipients: { to: [{ address: email }] }
-      };
-
-      context.log('Sending auto-reply email');
-      try {
-        const autoReplyPoller = await emailClient.beginSend(autoReplyEmail);
-        context.log('Auto-reply email send initiated, waiting for completion');
-        await autoReplyPoller.pollUntilDone();
-        context.log('Auto-reply email sent successfully');
-      } catch (emailError: any) {
-        context.error('Error sending auto-reply email:', emailError);
-        throw new Error(`Failed to send auto-reply email: ${emailError.message}`);
-      }
-
-      context.log('Contact form processing completed successfully');
+    // Validate phone number
+    if (!isValidPhone(formData.phone)) {
       return {
-        status: 200,
-        jsonBody: { message: "Form submitted successfully" }
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Invalid phone number' })
       };
-    } catch (emailClientError: any) {
-      context.error('Error initializing email client:', emailClientError);
-      throw new Error(`Failed to initialize email client: ${emailClientError.message}`);
     }
+
+    // Validate zip code
+    if (!isValidZipCode(formData.zipCode)) {
+      return {
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Invalid zip code format' })
+      };
+    }
+
+    // Check for gibberish in names
+    if (isGibberish(formData.firstName) || isGibberish(formData.lastName)) {
+      context.log('Gibberish detected in names');
+      return {
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Please enter valid names' })
+      };
+    }
+
+    // Check for URLs in description (spam protection)
+    if (formData.description && containsUrls(formData.description)) {
+      context.log('URLs detected in description - potential spam');
+      return {
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'URLs are not allowed in the description' })
+      };
+    }
+
+    // Validate reCAPTCHA if token is provided
+    if (formData.recaptchaToken) {
+      if (!RECAPTCHA_SECRET_KEY) {
+        context.log('reCAPTCHA secret key not configured');
+        return {
+          status: 500,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ error: 'reCAPTCHA not configured' })
+        };
+      }
+
+      const recaptchaResult = await validateRecaptcha(formData.recaptchaToken);
+      if (!recaptchaResult.success || recaptchaResult.score < 0.5) {
+        context.log('reCAPTCHA validation failed:', recaptchaResult);
+        return {
+          status: 400,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ error: 'reCAPTCHA validation failed' })
+        };
+      }
+      context.log('reCAPTCHA validation successful, score:', recaptchaResult.score);
+    }
+
+    // Send email using Azure Communication Services
+    if (!CONNECTION_STRING) {
+      context.log('Azure Communication Services connection string not configured');
+      return {
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Email service not configured' })
+      };
+    }
+
+    const emailClient = new EmailClient(CONNECTION_STRING);
+
+    // Create email content
+    const emailSubject = `New Contact Form Submission - ${formData.caseType}`;
+    const emailBody = `
+      <h2>New Contact Form Submission</h2>
+      <p><strong>Name:</strong> ${formData.firstName} ${formData.lastName}</p>
+      <p><strong>Email:</strong> ${formData.email}</p>
+      <p><strong>Phone:</strong> ${formData.phone}</p>
+      <p><strong>Zip Code:</strong> ${formData.zipCode}</p>
+      <p><strong>Case Type:</strong> ${formData.caseType}</p>
+      ${formData.description ? `<p><strong>Description:</strong><br>${formData.description.replace(/\n/g, '<br>')}</p>` : ''}
+      <p><strong>Submitted:</strong> ${new Date().toLocaleString()}</p>
+      <p><strong>IP Address:</strong> ${clientIp}</p>
+    `;
+
+    const emailMessage = {
+      senderAddress: SENDER_ADDRESS,
+      content: {
+        subject: emailSubject,
+        html: emailBody,
+      },
+      recipients: {
+        to: RECIPIENT_ADDRESSES.map(email => ({ address: email })),
+      },
+    };
+
+    try {
+      const poller = await emailClient.beginSend(emailMessage);
+      const result = await poller.pollUntilDone();
+      context.log('Email sent successfully:', result.id);
+    } catch (emailError) {
+      context.log('Failed to send email:', emailError);
+      return {
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ error: 'Failed to send email' })
+      };
+    }
+
+    // Return success response
+    return {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ 
+        success: true, 
+        message: 'Form submitted successfully' 
+      })
+    };
+
   } catch (error) {
-    context.error('Error processing contact form:', error);
-    if (error instanceof Error) {
-      context.log(`Error name: ${error.name}`);
-      context.log(`Error message: ${error.message}`);
-      context.log(`Error stack: ${error.stack}`);
-    } else {
-      context.log(`Unknown error type: ${typeof error}`);
-    }
-    
+    context.log('Unexpected error:', error);
     return {
       status: 500,
-      jsonBody: { 
-        error: "An error occurred while processing your request",
-        message: error instanceof Error ? error.message : String(error)
-      }
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ error: 'Internal server error' })
     };
   }
 }
 
 app.http('contactForm', {
-    methods: ['POST'],
+    methods: ['POST', 'OPTIONS'],
     authLevel: 'anonymous',
     handler: contactForm
 });
