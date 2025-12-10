@@ -4,7 +4,7 @@ import { EmailClient } from "@azure/communication-email";
 // Environment variables - set these in Azure Function App settings
 const CONNECTION_STRING = process.env.ACS_CONNECTION_STRING as string;
 const SENDER_ADDRESS = process.env.SENDER_EMAIL_ADDRESS || "DoNotReply@2dde48cf-f3cb-436b-838a-1c27aa0e1c0c.azurecomm.net";
-const RECIPIENT_ADDRESSES = ["brad@bullattorneys.com", "web@bullattorneys.com"];
+const RECIPIENT_ADDRESSES = ["Sudheer@bullattorneys.com"];
 const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY as string;
 
 // Rate limiting store (in production, use Redis or a database)
