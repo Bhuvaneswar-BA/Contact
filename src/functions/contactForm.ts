@@ -1,11 +1,11 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
 import { EmailClient } from "@azure/communication-email";
 
-// Environment variables - set these in Azure Function App settings
-const CONNECTION_STRING = process.env.ACS_CONNECTION_STRING as string;
+// Environment variables - set these in Azure Function App settings or use hardcoded fallbacks
+const CONNECTION_STRING = process.env.ACS_CONNECTION_STRING || "endpoint=https://bullattorneys-acs.unitedstates.communication.azure.com/;accesskey=4u1LJnsWudD3ZeNKis43JRu10iCYYPce4k03STjm9HAPRwTfx9n9JQQJ99BCACULyCpw5CM7AAAAAZCSNGsk";
 const SENDER_ADDRESS = process.env.SENDER_EMAIL_ADDRESS || "DoNotReply@2dde48cf-f3cb-436b-838a-1c27aa0e1c0c.azurecomm.net";
 const RECIPIENT_ADDRESSES = ["Sudheer@bullattorneys.com"];
-const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY as string;
+const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY || "6Lc-afUqAAAAAE3oldmUdMiadO3GTZ1M179qYvc6";
 
 // Rate limiting store (in production, use Redis or a database)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
