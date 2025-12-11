@@ -376,7 +376,7 @@ export async function contactForm(request: HttpRequest, context: InvocationConte
       <p><strong>Zip Code:</strong> ${formData.zipCode}</p>
       <p><strong>Case Type:</strong> ${formData.caseType}</p>
       ${formData.description ? `<p><strong>Description:</strong><br>${formData.description.replace(/\n/g, '<br>')}</p>` : ''}
-      <p><strong>Submitted:</strong> ${new Date().toLocaleString()}</p>
+      <p><strong>Submitted:</strong> ${new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', dateStyle: 'medium', timeStyle: 'medium' })}</p>
       <p><strong>IP Address:</strong> ${clientIp}</p>
     `;
 
