@@ -4,7 +4,7 @@ import { EmailClient } from "@azure/communication-email";
 // Environment variables - set these in Azure Function App settings
 const CONNECTION_STRING = process.env.ACS_CONNECTION_STRING as string;
 const SENDER_ADDRESS = process.env.SENDER_EMAIL_ADDRESS || "DoNotReply@2dde48cf-f3cb-436b-838a-1c27aa0e1c0c.azurecomm.net";
-const RECIPIENT_ADDRESSES = ["brad@bullattorneys.com", "web@bullattorneys.com"];
+const RECIPIENT_ADDRESSES = ["brad@bullattorneys.com", "sudheer@bullattorneys.com", "web@bullattorneys.com"];
 const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY as string;
 
 // Rate limiting store (in production, use Redis or a database)
@@ -13,6 +13,7 @@ const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 // Blocked emails
 const BLOCKED_EMAILS = [
   'jacobroyvisser55@gmail.com',
+  'Jacobvisser45@gmail.com',
   // Add more blocked emails here
 ];
 
@@ -345,6 +346,10 @@ export async function contactForm(request: HttpRequest, context: InvocationConte
     }
 
     // Send email using Azure Communication Services
+    context.log('Checking CONNECTION_STRING:', CONNECTION_STRING ? 'Present' : 'Missing');
+    context.log('SENDER_ADDRESS:', SENDER_ADDRESS);
+    context.log('RECIPIENT_ADDRESSES:', RECIPIENT_ADDRESSES);
+    
     if (!CONNECTION_STRING) {
       context.log('Azure Communication Services connection string not configured');
       return {
@@ -357,7 +362,9 @@ export async function contactForm(request: HttpRequest, context: InvocationConte
       };
     }
 
+    context.log('Creating EmailClient...');
     const emailClient = new EmailClient(CONNECTION_STRING);
+    context.log('EmailClient created successfully');
 
     // Create email content
     const emailSubject = `New Contact Form Submission - ${formData.caseType}`;
@@ -388,15 +395,20 @@ export async function contactForm(request: HttpRequest, context: InvocationConte
       const poller = await emailClient.beginSend(emailMessage);
       const result = await poller.pollUntilDone();
       context.log('Email sent successfully:', result.id);
-    } catch (emailError) {
-      context.log('Failed to send email:', emailError);
+    } catch (emailError: any) {
+      const errorMessage = emailError?.message || String(emailError);
+      context.log('Failed to send email:', errorMessage);
+      context.error('Email error details:', emailError);
       return {
         status: 500,
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ error: 'Failed to send email' })
+        body: JSON.stringify({ 
+          error: 'Failed to send email',
+          details: errorMessage 
+        })
       };
     }
 
