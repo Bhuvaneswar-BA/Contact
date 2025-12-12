@@ -10,10 +10,10 @@ const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY as string;
 // Rate limiting store (in production, use Redis or a database)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
-// Blocked emails
+// Blocked emails (all lowercase for case-insensitive matching)
 const BLOCKED_EMAILS = [
   'jacobroyvisser55@gmail.com',
-  'Jacobvisser45@gmail.com',
+  'jacobvisser45@gmail.com',
   // Add more blocked emails here
 ];
 
